@@ -67,6 +67,53 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * An expected, operational failure — a condition the application anticipated
+ * and handled deliberately (e.g. validation errors, not-found, rate limits).
+ *
+ * These map directly to HTTP status codes and are safe to surface to clients.
+ * The global error handler treats them as handled and does NOT trigger alerts.
+ *
+ * @extends ApiError
+ */
+class OperationalError extends ApiError {
+  constructor(code, message, options = {}) {
+    super(code, message, options);
+    this.name = 'OperationalError';
+    /** @type {true} Distinguishes handled failures from programming mistakes. */
+    this.isOperational = true;
+  }
+}
+
+/**
+ * An unexpected programmer error — a bug in the application (e.g. a null
+ * dereference, failed assertion, or violated invariant).
+ *
+ * These always result in a 500 Internal Server Error with a generic message
+ * so internal details are never leaked to clients. The global error handler
+ * treats them as unhandled and fires a critical alert.
+ *
+ * @extends Error
+ */
+class ProgrammerError extends Error {
+  /**
+   * @param {string} message - Internal description of the bug (not sent to clients).
+   * @param {{ cause?: unknown, context?: Record<string, unknown> }} [options]
+   */
+  constructor(message, options = {}) {
+    super(message, { cause: options.cause });
+    this.name = 'ProgrammerError';
+    /** @type {false} Marks this as an unhandled, unexpected failure. */
+    this.isOperational = false;
+    this.statusCode = 500;
+    this.code = 'INTERNAL_ERROR';
+    /** @type {Record<string, unknown> | undefined} Extra debug context for logs. */
+    if (options.context) {
+      this.context = options.context;
+    }
+  }
+}
+
 /** Reverse lookup for errors that carry only a status (thrown by libraries). */
 const codeForStatus = (statusCode) =>
   Object.keys(ERROR_CODES).find((code) => ERROR_CODES[code] === statusCode) ||
@@ -89,4 +136,4 @@ const errorBody = (code, message, { details, correlationId, referenceId } = {}) 
   ...(referenceId ? { reference_id: referenceId } : {}),
 });
 
-module.exports = { ApiError, ERROR_CODES, DEFAULT_MESSAGES, codeForStatus, errorBody };
+module.exports = { ApiError, OperationalError, ProgrammerError, ERROR_CODES, DEFAULT_MESSAGES, codeForStatus, errorBody };

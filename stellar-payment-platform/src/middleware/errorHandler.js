@@ -2,13 +2,64 @@
 
 const crypto = require('crypto');
 const { logger } = require('../logger');
-const { ApiError, codeForStatus, errorBody, DEFAULT_MESSAGES } = require('../errors');
+const { ApiError, ProgrammerError, codeForStatus, errorBody, DEFAULT_MESSAGES } = require('../errors');
+
+/**
+ * Fires a critical alert for programmer errors.
+ *
+ * In production this would page on-call (PagerDuty, OpsGenie, SNS, etc.).
+ * Currently logs at `fatal` level so any log aggregator or alert rule can
+ * key on severity=fatal. Extend this function to call your alerting provider.
+ *
+ * @param {Error} err - The programmer error that triggered the alert.
+ * @param {import('express').Request} req - The originating request.
+ * @param {string} referenceId - The reference ID logged with the error.
+ */
+const triggerCriticalAlert = (err, req, referenceId) => {
+  const logPayload = {
+    referenceId,
+    correlationId: req && req.correlationId,
+    method: req && req.method,
+    path: req && req.path,
+    errorName: err.name,
+    errorMessage: err.message,
+    context: err.context,
+  };
+  const criticalMessage = '[CRITICAL] Programmer error detected — this is a bug that needs immediate attention';
+
+  // Use fatal level when available (winston/pino support it); fall back to
+  // error so the alert fires regardless of the logger implementation.
+  if (typeof logger.fatal === 'function') {
+    logger.fatal(logPayload, criticalMessage);
+  } else {
+    logger.error(logPayload, criticalMessage);
+  }
+
+  // Production hook: call your alerting provider here.
+  // Examples:
+  //   await pagerduty.createIncident({ ... });
+  //   await sns.publish({ TopicArn: CRITICAL_ALERTS_ARN, Message: ... });
+  //   Sentry.captureException(err, { level: 'fatal' });
+  //
+  // The hook is intentionally synchronous (fire-and-forget) so an alerting
+  // provider failure can never suppress the error response to the client.
+};
 
 /**
  * Maps errors thrown by libraries, which carry their own conventions rather
  * than a code, onto the platform's codes.
  */
 const classify = (err, req, isPrismaConnectionError) => {
+  if (err instanceof ProgrammerError) {
+    return {
+      code: 'INTERNAL_ERROR',
+      statusCode: 500,
+      message: err.message, // internal message - will be scrubbed in response
+      expected: false,
+      isOperational: false,
+    };
+  }
+
   if (err instanceof ApiError) {
     return {
       code: err.code,
@@ -16,6 +67,7 @@ const classify = (err, req, isPrismaConnectionError) => {
       message: err.message,
       details: err.details,
       expected: true,
+      isOperational: err.isOperational !== false, // OperationalError or ApiError are both operational
     };
   }
 
@@ -82,6 +134,13 @@ const buildErrorHandler = (isPrismaConnectionError) =>
       }
       logger.error(`[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`, err);
 
+      // Programmer errors (isOperational === false or unknown unexpected errors)
+      // trigger a critical alert so the on-call team is paged immediately.
+      const isProgrammerError = err.isOperational === false || !(err instanceof ApiError);
+      if (isProgrammerError) {
+        triggerCriticalAlert(err, req, referenceId);
+      }
+
       return res.status(statusCode).json(
         errorBody(code, expected ? message : DEFAULT_MESSAGES.INTERNAL_ERROR, {
           correlationId: req.correlationId,
@@ -103,4 +162,4 @@ const notFoundHandler = (req, res) =>
     }),
   );
 
-module.exports = { buildErrorHandler, notFoundHandler, classify };
+module.exports = { buildErrorHandler, notFoundHandler, classify, triggerCriticalAlert };
