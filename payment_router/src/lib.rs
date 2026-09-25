@@ -160,6 +160,28 @@ pub struct TimelockEntry {
     pub action: ActionType,
 }
 
+/// A pending time-locked escrow deposit stored in persistent ledger storage.
+///
+/// Funds are held by the contract until `release_time` has passed, at which
+/// point the `recipient` may call `release_escrow` to claim them, or the
+/// `sender` may call `reclaim_escrow` if the recipient does not.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowDeposit {
+    /// Address that deposited the funds.
+    pub sender: Address,
+    /// Address entitled to claim the funds after `release_time`.
+    pub recipient: Address,
+    /// Contract ID of the escrowed token.
+    pub token: Address,
+    /// Amount held in escrow, in the token's smallest unit.
+    pub amount: i128,
+    /// Ledger timestamp (seconds since epoch) after which funds can be released.
+    pub release_time: u64,
+    /// Set to `true` once the funds have been claimed or reclaimed.
+    pub claimed: bool,
+}
+
 /// Storage keys for all contract instance and persistent data.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +220,12 @@ pub enum DataKey {
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
+    /// Monotonically-increasing nonce counter for escrow deposit IDs.
+    /// Stored as `u64` in instance storage.
+    EscrowNonce,
+    /// A pending escrow deposit keyed by its nonce ID.
+    /// Stored in persistent storage so it survives instance eviction.
+    EscrowDeposit(u64),
 }
 
 /// Contract-level errors returned instead of panicking, so callers get a
@@ -236,6 +264,12 @@ pub enum Error {
     TimelockNotFound = 13,
     /// The contract is frozen; all payments and timelock executions are blocked.
     ContractFrozen = 14,
+    /// Escrow funds are still locked; the release time has not been reached.
+    EscrowLocked = 15,
+    /// No escrow deposit exists for the supplied ID.
+    EscrowNotFound = 16,
+    /// The escrow release window has expired and funds have been reclaimed.
+    EscrowExpired = 17,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -353,6 +387,19 @@ impl PaymentRouter {
             .unwrap_or(0u64);
         let next = current + 1;
         env.storage().instance().set(&DataKey::TimelockNonce, &next);
+        next
+    }
+
+    /// Allocates and returns the next escrow nonce, incrementing the counter.
+    /// The counter is stored in instance storage under `DataKey::EscrowNonce`.
+    fn next_escrow_nonce(env: &Env) -> u64 {
+        let current: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowNonce)
+            .unwrap_or(0u64);
+        let next = current + 1;
+        env.storage().instance().set(&DataKey::EscrowNonce, &next);
         next
     }
 
@@ -1455,6 +1502,215 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn version(_env: Env) -> u32 {
         Self::VERSION
+    }
+
+    // ── Escrow: create / release / reclaim / query ───────────────────────────
+    //
+    // A time-locked escrow holds tokens on behalf of a sender until a
+    // `release_time` ledger timestamp is reached.  After that point:
+    //  • The `recipient` can call `release_escrow` to pull the funds.
+    //  • The `sender` can call `reclaim_escrow` to recover the funds if the
+    //    recipient never claimed them.
+    //
+    // Funds are transferred into the contract on `create_escrow` and out of the
+    // contract on `release_escrow` / `reclaim_escrow`.  The entry is removed from
+    // storage in both cases (checks-effects-interactions pattern).
+
+    /// Creates a new time-locked escrow, transferring `amount` tokens from
+    /// `sender` into the contract and returning a unique escrow ID (nonce).
+    ///
+    /// # Parameters
+    /// - `sender`: Address providing the funds; must authorize the call.
+    /// - `recipient`: Address entitled to claim the funds after `release_time`.
+    /// - `token`: Contract ID of the token to escrow.
+    /// - `amount`: Amount to lock, in the token's smallest unit.
+    /// - `release_time`: Ledger timestamp (seconds since epoch) after which the
+    ///   funds may be released.  Must be strictly in the future.
+    ///
+    /// # Returns
+    /// `Ok(escrow_id)` — the unique numeric ID of the created escrow.
+    ///
+    /// # Errors
+    /// - `ContractFrozen` — contract is frozen.
+    /// - `Paused` — contract is paused.
+    /// - `EscrowLocked` — `release_time` is not in the future.
+    pub fn create_escrow(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        amount: i128,
+        release_time: u64,
+    ) -> Result<u64, Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::Paused);
+        }
+
+        sender.require_auth();
+
+        // release_time must be strictly in the future.
+        if release_time <= env.ledger().timestamp() {
+            return Err(Error::EscrowLocked);
+        }
+
+        // Transfer funds from sender into the contract.
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&sender, &env.current_contract_address(), &amount);
+
+        // Allocate a new escrow ID.
+        let nonce = Self::next_escrow_nonce(&env);
+
+        let deposit = EscrowDeposit {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token,
+            amount,
+            release_time,
+            claimed: false,
+        };
+
+        let key = DataKey::EscrowDeposit(nonce);
+        env.storage().persistent().set(&key, &deposit);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("esc_creat"), sender, recipient),
+            (nonce, amount),
+        );
+
+        Ok(nonce)
+    }
+
+    /// Releases escrowed funds to the recipient after the lock period has elapsed.
+    ///
+    /// # Parameters
+    /// - `escrow_id`: The nonce returned by `create_escrow`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `ContractFrozen` — contract is frozen.
+    /// - `EscrowNotFound` — no escrow exists for `escrow_id`, or it was already claimed.
+    /// - `EscrowLocked` — the release time has not been reached yet.
+    pub fn release_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        if Self::is_frozen_internal(&env) {
+            return Err(Error::ContractFrozen);
+        }
+
+        let key = DataKey::EscrowDeposit(escrow_id);
+        let deposit: EscrowDeposit = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EscrowNotFound)?;
+
+        if deposit.claimed {
+            return Err(Error::EscrowNotFound);
+        }
+
+        deposit.recipient.require_auth();
+
+        if env.ledger().timestamp() < deposit.release_time {
+            return Err(Error::EscrowLocked);
+        }
+
+        // Remove entry before transferring (checks-effects-interactions).
+        env.storage().persistent().remove(&key);
+
+        let token_client = token::Client::new(&env, &deposit.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &deposit.recipient,
+            &deposit.amount,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("esc_rls"),
+                deposit.sender,
+                deposit.recipient.clone(),
+            ),
+            (escrow_id, deposit.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Reclaims escrowed funds back to the sender after the lock period has
+    /// elapsed (used when the recipient did not claim in time).
+    ///
+    /// # Parameters
+    /// - `escrow_id`: The nonce returned by `create_escrow`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - `EscrowNotFound` — no escrow exists for `escrow_id`, or it was already claimed.
+    /// - `EscrowLocked` — the release time has not been reached yet; sender must
+    ///   wait for the window to pass before reclaiming.
+    pub fn reclaim_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let key = DataKey::EscrowDeposit(escrow_id);
+        let deposit: EscrowDeposit = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EscrowNotFound)?;
+
+        if deposit.claimed {
+            return Err(Error::EscrowNotFound);
+        }
+
+        deposit.sender.require_auth();
+
+        if env.ledger().timestamp() < deposit.release_time {
+            return Err(Error::EscrowLocked);
+        }
+
+        // Remove entry before transferring (checks-effects-interactions).
+        env.storage().persistent().remove(&key);
+
+        let token_client = token::Client::new(&env, &deposit.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &deposit.sender,
+            &deposit.amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("esc_rclm"), deposit.sender.clone()),
+            (escrow_id, deposit.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Returns the `EscrowDeposit` for the given ID without consuming it.
+    ///
+    /// # Parameters
+    /// - `escrow_id`: The nonce returned by `create_escrow`.
+    ///
+    /// # Returns
+    /// `Ok(EscrowDeposit)` or `Err(EscrowNotFound)`.
+    pub fn get_escrow(env: Env, escrow_id: u64) -> Result<EscrowDeposit, Error> {
+        let key = DataKey::EscrowDeposit(escrow_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::EscrowNotFound)
     }
 }
 
@@ -2582,6 +2838,189 @@ mod test {
         // Governance address can now update the fee
         client.set_fee_bps(&200);
         assert_eq!(client.get_fee(), 200);
+    }
+
+    // ── Escrow tests ─────────────────────────────────────────────────────────
+
+    /// Shared helper: initialises a contract with zero fees so escrow balance
+    /// arithmetic is straightforward.
+    fn setup_escrow_env() -> (
+        Env,
+        PaymentRouterClient<'static>,
+        Address, // contract_id
+        Address, // sender
+        Address, // recipient
+        Address, // token_address
+        token::Client<'static>,
+        token::StellarAssetClient<'static>,
+    ) {
+        let (env, client, contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        // Zero fee so balances are easy to reason about.
+        client.initialize(&admin, &treasury, &0, &0, &PaymentRouter::MAX_AMOUNT);
+
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &100_000);
+
+        (
+            env,
+            client,
+            contract_id,
+            sender,
+            recipient,
+            token_address,
+            token_client,
+            sac,
+        )
+    }
+
+    #[test]
+    fn test_create_and_release_escrow() {
+        let (env, client, _contract_id, sender, recipient, token_address, token_client, _sac) =
+            setup_escrow_env();
+
+        let amount = 5_000i128;
+        let now = env.ledger().timestamp();
+        let release_time = now + 1_000;
+
+        let escrow_id = client.create_escrow(&sender, &recipient, &token_address, &amount, &release_time);
+        assert_eq!(escrow_id, 1);
+
+        // Sender's balance should have decreased by amount.
+        assert_eq!(token_client.balance(&sender), 100_000 - amount);
+        // Recipient hasn't received anything yet.
+        assert_eq!(token_client.balance(&recipient), 0);
+
+        // Advance ledger past release time.
+        env.ledger().set(LedgerInfo {
+            timestamp: release_time + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        client.release_escrow(&escrow_id);
+
+        // Recipient should now hold the escrowed amount.
+        assert_eq!(token_client.balance(&recipient), amount);
+
+        // Escrow entry should be gone.
+        let res = client.try_get_escrow(&escrow_id);
+        assert_eq!(res.unwrap_err().unwrap(), Error::EscrowNotFound);
+    }
+
+    #[test]
+    fn test_release_escrow_before_time_fails() {
+        let (env, client, _contract_id, sender, recipient, token_address, _token_client, _sac) =
+            setup_escrow_env();
+
+        let now = env.ledger().timestamp();
+        let release_time = now + 1_000;
+
+        let escrow_id =
+            client.create_escrow(&sender, &recipient, &token_address, &1_000, &release_time);
+
+        // Try to release immediately — should be locked.
+        let res = client.try_release_escrow(&escrow_id);
+        assert_eq!(res.unwrap_err().unwrap(), Error::EscrowLocked);
+    }
+
+    #[test]
+    fn test_reclaim_escrow_after_time() {
+        let (env, client, _contract_id, sender, recipient, token_address, token_client, _sac) =
+            setup_escrow_env();
+
+        let amount = 3_000i128;
+        let now = env.ledger().timestamp();
+        let release_time = now + 500;
+
+        let escrow_id =
+            client.create_escrow(&sender, &recipient, &token_address, &amount, &release_time);
+
+        let sender_balance_after_escrow = token_client.balance(&sender);
+
+        // Advance past the release time.
+        env.ledger().set(LedgerInfo {
+            timestamp: release_time + 1,
+            protocol_version: env.ledger().protocol_version(),
+            sequence_number: env.ledger().sequence(),
+            network_id: env.ledger().network_id().into(),
+            base_reserve: 100,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6312000,
+        });
+
+        client.reclaim_escrow(&escrow_id);
+
+        // Sender gets the funds back.
+        assert_eq!(
+            token_client.balance(&sender),
+            sender_balance_after_escrow + amount
+        );
+        // Recipient got nothing.
+        assert_eq!(token_client.balance(&recipient), 0);
+
+        // Entry is gone.
+        let res = client.try_get_escrow(&escrow_id);
+        assert_eq!(res.unwrap_err().unwrap(), Error::EscrowNotFound);
+    }
+
+    #[test]
+    fn test_reclaim_before_release_time_fails() {
+        let (env, client, _contract_id, sender, recipient, token_address, _token_client, _sac) =
+            setup_escrow_env();
+
+        let now = env.ledger().timestamp();
+        let release_time = now + 1_000;
+
+        let escrow_id =
+            client.create_escrow(&sender, &recipient, &token_address, &1_000, &release_time);
+
+        // Reclaim immediately — should still be locked.
+        let res = client.try_reclaim_escrow(&escrow_id);
+        assert_eq!(res.unwrap_err().unwrap(), Error::EscrowLocked);
+    }
+
+    #[test]
+    fn test_release_escrow_not_found() {
+        let (_env, client, _contract_id, _sender, _recipient, _token_address, _token_client, _sac) =
+            setup_escrow_env();
+
+        let res = client.try_release_escrow(&999u64);
+        assert_eq!(res.unwrap_err().unwrap(), Error::EscrowNotFound);
+    }
+
+    #[test]
+    fn test_create_escrow_invalid_release_time() {
+        let (env, client, _contract_id, sender, recipient, token_address, _token_client, _sac) =
+            setup_escrow_env();
+
+        // release_time in the past (or equal to current timestamp) → EscrowLocked.
+        let past_time = env.ledger().timestamp(); // equal, not strictly future
+        let res =
+            client.try_create_escrow(&sender, &recipient, &token_address, &1_000, &past_time);
+        assert_eq!(res.unwrap_err().unwrap(), Error::EscrowLocked);
+    }
+
+    #[test]
+    fn test_escrow_blocked_when_frozen() {
+        let (env, client, _contract_id, sender, recipient, token_address, _token_client, _sac) =
+            setup_escrow_env();
+
+        client.emergency_freeze();
+
+        let release_time = env.ledger().timestamp() + 1_000;
+        let res =
+            client.try_create_escrow(&sender, &recipient, &token_address, &1_000, &release_time);
+        assert_eq!(res.unwrap_err().unwrap(), Error::ContractFrozen);
     }
 }
 
